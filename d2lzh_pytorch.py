@@ -1,12 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import math
 import random
+import time
 
 import torch
 from IPython import display
 from matplotlib import pyplot as plt
 import zipfile
 import numpy as np
+from torch import nn
+
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -181,3 +185,128 @@ def grad_clipping(params, theta, device):
     if norm > theta:
         for param in params:
             param.grad.data *= (theta / norm)
+
+
+'''
+跟之前章节的模型训练函数相比，这里的模型训练函数有以下几点不同：
+1、使用困惑度评价模型
+2、在迭代模型参数前裁剪梯度
+3、对时序数据采用不同采样方法将导致隐藏状态初始化的不同。
+'''
+
+
+def train_and_predict_rnn(rnn, get_params, init_rnn_state, num_hiddens,
+                          vocab_size, device, corpus_indices, idx_to_char,
+                          char_to_idx, is_random_iter, num_epochs, num_steps,
+                          lr, clipping_theta, batch_size, pred_period,
+                          pred_len, prefixes):
+    if is_random_iter:
+        data_iter_fn = data_iter_random
+    else:
+        data_iter_fn = data_iter_consecutive
+    params = get_params()
+    loss = nn.CrossEntropyLoss()
+
+    for epoch in range(num_epochs):
+        if not is_random_iter:  # 如使用相邻采样，在epoch开始时初始化隐藏状态
+            state = init_rnn_state(batch_size, num_hiddens, device)
+        l_sum, n, start = 0.0, 0, time.time()
+        data_iter = data_iter_fn(corpus_indices, batch_size, num_steps, device)
+        for X, Y in data_iter:
+            if is_random_iter:  # 如使用随机采样，在每个小批量更新前初始化隐藏状态
+                state = init_rnn_state(batch_size, num_hiddens, device)
+            else:
+                # 否则需要使用detach函数从计算图分离隐藏状态，这是为了
+                # 使模型参数的梯度计算只依赖一次迭代读取的小批量序列（防止梯度计算开销太大）
+                for s in state:
+                    s.detach_()
+
+            inputs = to_onehot(X, vocab_size)
+            (outputs, state) = rnn(inputs, state, params)
+            outputs = torch.cat(outputs, dim=0)
+            y = torch.transpose(Y, 0, 1).contiguous().view(-1)
+            # 使用交叉熵损失计算平均分类误差
+            l = loss(outputs, y.long())
+
+            # 梯度清0
+            if params[0].grad is not None:
+                for param in params:
+                    param.grad.data.zero_()
+            l.backward()
+            grad_clipping(params, clipping_theta, device)  # 裁剪梯度
+            sgd(params, lr, 1)
+            l_sum += l.item() * y.shape[0]
+            n += y.shape[0]
+
+        if (epoch + 1) % pred_period == 0:
+            print('epoch %d, perplexity %f, time %.2f sec' % (
+                epoch + 1, math.exp(l_sum / n), time.time() - start
+            ))
+            for prefix in prefixes:
+                print(' -', predict_rnn(prefix, pred_len, rnn, params, init_rnn_state,
+                                        num_hiddens, vocab_size, device, idx_to_char, char_to_idx))
+
+
+def predict_rnn_pytorch(prefix, num_chars, model, vocab_size,
+                        device, idx_to_char, char_to_idx):
+    state = None
+    output = [char_to_idx[prefix[0]]]
+    for t in range(num_chars + len(prefix) - 1):
+        X = torch.tensor([output[-1]], device=device).view(1, 1)
+        if state is not None:
+            if isinstance(state, tuple):
+                state = (state[0].to(device), state[1].to(device))
+            else:
+                state = state.to(device)
+
+        (Y, state) = model(X, state)
+        if t < len(prefix) - 1:
+            output.append(char_to_idx[prefix[t+1]])
+        else:
+            output.append(int(Y.argmax(dim=1).item()))
+    return ''.join([idx_to_char[i] for i in output])
+
+
+def train_and_predict_rnn_pytorch(model, num_hiddens, vocab_size, device,
+                                  corpus_indices, idx_to_char, char_to_idx,
+                                  num_epochs, num_steps, lr, clipping_theta,
+                                  batch_size, pred_period, pred_len, prefixes):
+    loss = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model.to(device)
+    state = None
+    for epoch in range(num_epochs):
+        l_sum, n, start = 0.0, 0, time.time()
+        data_iter = data_iter_consecutive(corpus_indices, batch_size, num_steps, device)
+        for X, Y in data_iter:
+            if state is not None:
+                if isinstance(state, tuple):
+                    state = (state[0].detach(), state[1].detach())
+                else:
+                    state = state.detach()
+
+            (output, state) = model(X, state)
+
+            y = torch.transpose(Y, 0, 1).contiguous().view(-1)
+            l = loss(output, y.long())
+
+            optimizer.zero_grad()
+            l.backward()
+            grad_clipping(model.parameters(), clipping_theta, device)
+            optimizer.step()
+            l_sum += l.item() * y.shape[0]
+            n += y.shape[0]
+
+        try:
+            perplexity = math.exp(l_sum / n)
+        except OverflowError:
+            perplexity = float('inf')
+        if (epoch + 1) % pred_period == 0:
+            print('epoch %d, perplexity %f, time %.2f sec' % (
+                epoch + 1, perplexity, time.time() - start
+            ))
+
+            for prefix in prefixes:
+                print(' -', predict_rnn_pytorch(
+                    prefix, pred_len, model, vocab_size, device, idx_to_char, char_to_idx
+                ))
